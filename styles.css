@@ -1,0 +1,37 @@
+.lr-splits-tip {
+    position: absolute;
+    z-index: 99999;
+    background: #0c0f14;
+    color: #e7e7e7;
+    border: 1px solid #2b2f38;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 12px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+    min-width: 300px;
+  }
+  .lr-splits-tip .hdr {
+    font-weight: 700;
+    margin-bottom: 6px;
+  }
+  .lr-splits-tip .subhdr {
+    margin-top: 8px;
+    margin-bottom: 4px;
+    color: #b7bcc6;
+  }
+  .lr-splits-tip .grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+  .lr-splits-tip .row {
+    display: grid;
+    grid-template-columns: 90px repeat(5, 50px) 50px;
+    gap: 6px;
+  }
+  .lr-splits-tip .head {
+    color: #9aa0a6;
+  }
+  .lr-splits-tip .cell.label {
+    font-weight: 600;
+  }

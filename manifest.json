@@ -1,0 +1,19 @@
+{
+    "manifest_version": 3,
+    "name": "ESPN Fantasy L/R Splits",
+    "version": "0.1.0",
+    "description": "Show hitter LHP/RHP splits on ESPN Fantasy Baseball.",
+    "permissions": ["storage"],
+    "host_permissions": ["https://statsapi.mlb.com/*"],
+    "background": {
+      "service_worker": "background.js"
+    },
+    "content_scripts": [
+      {
+        "matches": ["https://fantasy.espn.com/baseball/*"],
+        "js": ["content.js"],
+        "css": ["styles.css"],
+        "run_at": "document_idle"
+      }
+    ]
+  }
