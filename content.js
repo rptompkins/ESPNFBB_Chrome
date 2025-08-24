@@ -2,6 +2,56 @@ console.log("content script alive");
 
 const SEASON = new Date().getFullYear();
 
+// Debug utilities - available in browser console
+window.DSFBBUtils = {
+  clearPlayerCache: function(espnId, fullName, teamAbbr) {
+    chrome.runtime.sendMessage({
+      type: "clearPlayerCache",
+      payload: { espnId, fullName, teamAbbr }
+    }, (res) => {
+      console.log("Player cache cleared:", res);
+    });
+  },
+
+  clearAllCache: function() {
+    chrome.runtime.sendMessage({
+      type: "clearAllCache",
+      payload: {}
+    }, (res) => {
+      console.log("All cache cleared:", res);
+      alert("All extension cache cleared! Refresh the page and try hovering over players again.");
+    });
+  },
+
+  testPlayer: function(fullName, teamAbbr) {
+    console.log("Testing player resolution for:", fullName, teamAbbr);
+    chrome.runtime.sendMessage({
+      type: "fetchSplits", 
+      payload: { fullName, teamAbbr, season: new Date().getFullYear() }
+    }, (res) => {
+      console.log("Resolution result:", res);
+    });
+  }
+};
+
+// Also add legacy functions for easier access
+window.clearAllCache = window.DSFBBUtils.clearAllCache;
+window.clearPlayerCache = window.DSFBBUtils.clearPlayerCache;
+
+console.log("🔧 DSFBB Debug Utils loaded. Use DSFBBUtils.clearAllCache() or clearAllCache()");
+
+// Add a visual indicator that the extension is loaded
+const indicator = document.createElement("div");
+indicator.id = "dsfbb-loaded-indicator";
+indicator.innerHTML = "🔧 DSFBB: Ready";
+indicator.style.cssText = `
+  position: fixed; top: 10px; right: 10px; z-index: 10000; 
+  background: #28a745; color: white; padding: 5px 10px; 
+  border-radius: 4px; font-size: 12px; font-family: monospace;
+`;
+document.body.appendChild(indicator);
+setTimeout(() => indicator.remove(), 3000);
+
 const observer = new MutationObserver(() => init());
 init();
 

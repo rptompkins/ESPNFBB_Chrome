@@ -35,6 +35,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           ok: true,
           data: { mlbamId, seasonSplits, careerSplits }
         });
+      } else if (msg.type === "clearPlayerCache") {
+        const { espnId, fullName, teamAbbr } = msg.payload;
+        console.log("Clearing cache for", { espnId, fullName, teamAbbr });
+        
+        if (espnId) await clearCache(`map:espn:${espnId}`);
+        if (fullName) await clearCache(`id:${fullName}|${teamAbbr || ""}`);
+        
+        sendResponse({ ok: true });
+      } else if (msg.type === "clearAllCache") {
+        console.log("Clearing ALL extension cache");
+        await chrome.storage.local.set({ cache: {} });
+        sendResponse({ ok: true, message: "All cache cleared" });
       }
     } catch (e) {
       console.error("BG error", e);
@@ -52,7 +64,41 @@ async function resolveMlbPersonId({ espnId, fullName, teamAbbr }) {
     const mapped = await getCache(`map:espn:${espnId}`);
     if (mapped) {
       console.log(`Found cached ESPN mapping: ${espnId} -> ${mapped}`);
-      return mapped;
+      // Validate the cached mapping by checking if the name roughly matches
+      try {
+        const validateRes = await fetch(`${MLB_BASE}/people/${mapped}`);
+        if (validateRes.ok) {
+          const validateJson = await validateRes.json();
+          const cachedPlayerName = validateJson?.people?.[0]?.fullName || "";
+          
+          // More strict name validation
+          const normalizedCached = normalizeName(cachedPlayerName);
+          const normalizedRequested = normalizeName(fullName);
+          
+          // Check if last names match (most important for baseball)
+          const cachedLastName = normalizedCached.split(' ').pop();
+          const requestedLastName = normalizedRequested.split(' ').pop();
+          
+          const nameMatch = cachedLastName === requestedLastName;
+          
+          if (!nameMatch) {
+            console.log(`❌ INVALID CACHE: ESPN ID ${espnId} mapped to "${cachedPlayerName}" but requested "${fullName}"`);
+            console.log(`❌ Last names don't match: "${cachedLastName}" vs "${requestedLastName}"`);
+            await clearCache(`map:espn:${espnId}`);
+            // Also clear any name-based cache for good measure
+            await clearCache(`id:${fullName}|${teamAbbr || ""}`);
+          } else {
+            console.log(`✅ Cached mapping validated: "${cachedPlayerName}" matches "${fullName}"`);
+            return mapped;
+          }
+        } else {
+          console.log(`❌ Cache validation API call failed: ${validateRes.status}`);
+          await clearCache(`map:espn:${espnId}`);
+        }
+      } catch (e) {
+        console.log(`❌ Cache validation error, clearing: ${e.message}`);
+        await clearCache(`map:espn:${espnId}`);
+      }
     }
   }
 
@@ -63,12 +109,25 @@ async function resolveMlbPersonId({ espnId, fullName, teamAbbr }) {
     return cached;
   }
 
-  // Try multiple search strategies
+  // Try team roster first if we have team info - more reliable for newer players
+  if (teamAbbr) {
+    console.log(`🔍 Trying team roster search for ${fullName} on ${teamAbbr}`);
+    const rosterMatch = await searchTeamRoster(fullName, teamAbbr);
+    if (rosterMatch) {
+      console.log(`✅ Found via team roster: ${rosterMatch.fullName} (${rosterMatch.id})`);
+      const finalId = rosterMatch.id;
+      await setCache(cacheKey, finalId, ONE_DAY_MS);
+      if (espnId) await setCache(`map:espn:${espnId}`, finalId, ONE_DAY_MS);
+      return finalId;
+    }
+  }
+
+  // Fallback to search API (but with stricter validation)
+  console.log(`🔍 Trying MLB search API for ${fullName}`);
   const searchStrategies = [
     fullName,
     `${fullName.split(' ').pop()}, ${fullName.split(' ')[0]}`, // "Last, First" format
     fullName.split(' ').pop(), // Just last name
-    fullName.split(' ')[0]     // Just first name
   ];
 
   let bestMatch = null;
@@ -101,34 +160,47 @@ async function resolveMlbPersonId({ espnId, fullName, teamAbbr }) {
         const [pFirst, pLast] = splitName(stripSuffix(person.fullName || ""));
         let score = 0;
 
+        // STRICT: Both first and last name must match for search results
+        const firstMatch = pFirst && targetFirst && normalizeName(pFirst) === normalizeName(targetFirst);
+        const lastMatch = pLast && targetLast && normalizeName(pLast) === normalizeName(targetLast);
+        
+        if (!lastMatch) {
+          console.log(`  ❌ REJECTED: Last name "${pLast}" doesn't match "${targetLast}"`);
+          continue; // Skip entirely if last name doesn't match
+        }
+
+        // ADDITIONAL PROTECTION: Reject well-known mismatches
+        if (person.id === 457705 && normalizeName(fullName) !== 'andrew mccutchen') {
+          console.log(`  ❌ REJECTED McCutchen mismatch: "${fullName}" is not Andrew McCutchen`);
+          continue;
+        }
+
         // Exact name match gets highest priority
         if (normalizeName(person.fullName) === normalizeName(fullName)) {
-          score += 20;
-          console.log(`  +20 exact name match`);
+          score += 50;
+          console.log(`  +50 exact name match`);
         }
 
-        // Last name match
-        if (pLast && targetLast && normalizeName(pLast) === normalizeName(targetLast)) {
-          score += 10;
-          console.log(`  +10 last name match`);
-        }
+        // Last name match (required)
+        score += 15;
+        console.log(`  +15 last name match`);
 
         // First name match
-        if (pFirst && targetFirst && normalizeName(pFirst) === normalizeName(targetFirst)) {
-          score += 8;
-          console.log(`  +8 first name match`);
+        if (firstMatch) {
+          score += 20;
+          console.log(`  +20 first name match`);
         }
 
-        // Team match
+        // Team match - make this the highest priority
         if (teamAbbr && person.currentTeam?.abbreviation?.toUpperCase() === teamAbbr.toUpperCase()) {
-          score += 15; // High weight for team match
-          console.log(`  +15 team match (${person.currentTeam.abbreviation})`);
+          score += 30; // Very high weight for team match
+          console.log(`  +30 team match (${person.currentTeam.abbreviation})`);
         }
 
         // Active player bonus
         if (person.active) {
-          score += 2;
-          console.log(`  +2 active player`);
+          score += 5;
+          console.log(`  +5 active player`);
         }
 
         console.log(`  Final score: ${score}`);
@@ -140,8 +212,8 @@ async function resolveMlbPersonId({ espnId, fullName, teamAbbr }) {
         }
       }
       
-      // If we found a very good match (exact name + team), use it immediately
-      if (bestScore >= 35) {
+      // If we found a very good match, use it
+      if (bestScore >= 60) {
         console.log(`Found excellent match, stopping search: ${bestMatch.fullName} (${bestMatch.id})`);
         break;
       }
@@ -161,6 +233,72 @@ async function resolveMlbPersonId({ espnId, fullName, teamAbbr }) {
 
   return finalId;
 }
+
+// Search for a player in their team's roster - more reliable for newer players
+async function searchTeamRoster(fullName, teamAbbr) {
+  const teamId = TEAM_ABBR_TO_ID[teamAbbr.toUpperCase()];
+  if (!teamId) {
+    console.log(`❌ Unknown team abbreviation: ${teamAbbr}`);
+    return null;
+  }
+  
+  console.log(`🔍 Searching roster for team ${teamAbbr} (ID: ${teamId})`);
+  
+  try {
+    const url = `${MLB_BASE}/teams/${teamId}/roster`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.log(`❌ Roster fetch failed: ${res.status}`);
+      return null;
+    }
+    
+    const json = await res.json();
+    const roster = Array.isArray(json?.roster) ? json.roster : [];
+    console.log(`Found ${roster.length} players in ${teamAbbr} roster`);
+    
+    const [targetFirst, targetLast] = splitName(stripSuffix(fullName));
+    
+    for (const player of roster) {
+      const person = player.person;
+      if (!person?.fullName) continue;
+      
+      const [pFirst, pLast] = splitName(stripSuffix(person.fullName));
+      
+      // Check for exact name match
+      if (normalizeName(person.fullName) === normalizeName(fullName)) {
+        console.log(`✅ EXACT MATCH in roster: ${person.fullName} (${person.id})`);
+        return person;
+      }
+      
+      // Check for last name match with first name/initial match
+      if (pLast && targetLast && normalizeName(pLast) === normalizeName(targetLast)) {
+        if (pFirst && targetFirst && 
+           (normalizeName(pFirst) === normalizeName(targetFirst) || 
+            pFirst.charAt(0).toLowerCase() === targetFirst.charAt(0).toLowerCase())) {
+          console.log(`✅ NAME MATCH in roster: ${person.fullName} (${person.id})`);
+          return person;
+        }
+      }
+    }
+    
+    console.log(`❌ Player "${fullName}" not found in ${teamAbbr} roster`);
+    return null;
+    
+  } catch (error) {
+    console.log(`❌ Roster search error: ${error.message}`);
+    return null;
+  }
+}
+
+// Mapping of team abbreviations to MLB team IDs
+const TEAM_ABBR_TO_ID = {
+  'ATL': 144, 'MIA': 146, 'NYM': 121, 'PHI': 143, 'WSH': 120,
+  'CHC': 112, 'CIN': 113, 'MIL': 158, 'PIT': 134, 'STL': 138,
+  'ARI': 109, 'COL': 115, 'LAD': 119, 'SD': 135, 'SF': 137,
+  'BAL': 110, 'BOS': 111, 'NYY': 147, 'TB': 139, 'TOR': 141,
+  'CWS': 145, 'CLE': 114, 'DET': 116, 'KC': 118, 'MIN': 142,
+  'HOU': 117, 'LAA': 108, 'OAK': 133, 'SEA': 136, 'TEX': 140
+};
 
 function stripSuffix(name) {
   return (name || "").replace(/\s+(jr\.|sr\.|ii|iii|iv|v)$/i, "").trim();
@@ -214,68 +352,71 @@ async function getSeasonSplits(mlbamId, season) {
 }
 
 async function getCareerSplits(mlbamId) {
-  const cacheKey = `splits:career:v3:${mlbamId}`;
+  const cacheKey = `splits:career:v4:${mlbamId}`;
   const cached = await getCache(cacheKey);
   if (cached) {
     console.log(`Using cached career data for ${mlbamId}:`, cached);
     return cached;
   }
 
-  // Try career in a single call (omit season).
-  let url =
-    `${MLB_BASE}/people/${mlbamId}/stats?stats=statSplits` +
-    `&sitCodes=vl,vr&group=hitting&gameType=R`;
-  console.log("Career stats URL:", url);
-
-  let res = await fetch(url);
-  if (!res.ok) throw new Error(`career_splits_failed ${res.status}`);
-  let json = await res.json();
-
-  let vsLeft = pickFromSplitsEndpoint(json, "vl");
-  let vsRight = pickFromSplitsEndpoint(json, "vr");
-
-  console.log(`Career splits for player ${mlbamId}:`, { vsLeft, vsRight });
-
-  // If career returns empty for some players, aggregate per-season.
-  if (!hasData(vsLeft) && !hasData(vsRight)) {
-    console.log(`No career data found for ${mlbamId}, aggregating seasons...`);
-    const agg = await aggregateCareerBySeasonViaStats(mlbamId);
-    vsLeft = agg.vsLeft;
-    vsRight = agg.vsRight;
-    console.log(`Aggregated career splits for ${mlbamId}:`, { vsLeft, vsRight });
-  }
+  // Always aggregate by season for more reliable career totals
+  // The MLB API's career totals without season parameter can be unreliable
+  console.log(`Aggregating career stats by season for ${mlbamId}...`);
+  const agg = await aggregateCareerBySeasonViaStats(mlbamId);
+  const vsLeft = agg.vsLeft;
+  const vsRight = agg.vsRight;
+  
+  console.log(`Aggregated career splits for ${mlbamId}:`, { vsLeft, vsRight });
 
   const career = { vsLeft, vsRight };
   await setCache(cacheKey, career, ONE_DAY_MS);
   return career;
 }
 
-// Fallback: sum per-season using the same /stats endpoint
+// Aggregate career stats by summing all seasons
 async function aggregateCareerBySeasonViaStats(mlbamId) {
   const personRes = await fetch(`${MLB_BASE}/people/${mlbamId}`);
   if (!personRes.ok) throw new Error("person_fetch_failed");
   const person = await personRes.json();
-  const debut = person?.people?.[0]?.mlbDebutDate?.slice(0, 4) || "2010";
+  const debut = person?.people?.[0]?.mlbDebutDate?.slice(0, 4) || "2015";
   const currentYear = new Date().getFullYear();
+
+  console.log(`Aggregating career for player ${mlbamId} from ${debut} to ${currentYear}`);
 
   let aggL = initAgg();
   let aggR = initAgg();
+  let seasonsWithData = 0;
 
-  for (let y = Number(debut); y <= currentYear; y++) {
-    const url =
-      `${MLB_BASE}/people/${mlbamId}/stats?stats=statSplits` +
-      `&sitCodes=vl,vr&group=hitting&gameType=R&season=${y}`;
-    console.log("Season stats (career agg) URL:", url);
+  for (let y = Math.max(Number(debut), 2015); y <= currentYear; y++) {
+    try {
+      const url =
+        `${MLB_BASE}/people/${mlbamId}/stats?stats=statSplits` +
+        `&sitCodes=vl,vr&group=hitting&gameType=R&season=${y}`;
+      console.log(`Fetching ${y} season data for ${mlbamId}`);
 
-    const res = await fetch(url);
-    if (!res.ok) continue;
-    const j = await res.json();
-
-    const L = pickFromSplitsEndpoint(j, "vl");
-    const R = pickFromSplitsEndpoint(j, "vr");
-    aggL = addAgg(aggL, L);
-    aggR = addAgg(aggR, R);
+      const res = await fetch(url);
+      if (!res.ok) {
+        console.log(`No data for season ${y}: ${res.status}`);
+        continue;
+      }
+      
+      const j = await res.json();
+      const L = pickFromSplitsEndpoint(j, "vl");
+      const R = pickFromSplitsEndpoint(j, "vr");
+      
+      if (hasData(L) || hasData(R)) {
+        seasonsWithData++;
+        console.log(`Adding ${y} season data: vsL=${L?.pa || 0} PA, vsR=${R?.pa || 0} PA`);
+        aggL = addAgg(aggL, L);
+        aggR = addAgg(aggR, R);
+      }
+    } catch (error) {
+      console.log(`Error fetching ${y} season data:`, error.message);
+    }
   }
+
+  console.log(`Career aggregation complete: ${seasonsWithData} seasons with data`);
+  console.log(`Career totals: vsL=${aggL.pa} PA, vsR=${aggR.pa} PA`);
 
   return { vsLeft: finalizeAgg(aggL), vsRight: finalizeAgg(aggR) };
 }
@@ -416,5 +557,10 @@ async function getCache(key) {
 async function setCache(key, val, ttl) {
   const { cache = {} } = await chrome.storage.local.get("cache");
   cache[key] = { val, exp: Date.now() + ttl };
+  await chrome.storage.local.set({ cache });
+}
+async function clearCache(key) {
+  const { cache = {} } = await chrome.storage.local.get("cache");
+  delete cache[key];
   await chrome.storage.local.set({ cache });
 }
